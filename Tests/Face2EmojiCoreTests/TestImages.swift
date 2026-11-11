@@ -49,6 +49,30 @@ enum TestImages {
         return try #require(context.makeImage())
     }
 
+    /// One 8-bit sRGB pixel, colour premultiplied by alpha.
+    struct RGBA: Equatable, CustomStringConvertible {
+        var r, g, b, a: UInt8
+        var description: String { "(\(r), \(g), \(b), \(a))" }
+    }
+
+    /// The pixel of `image` at column `x` and row `y`, rows counted from the top,
+    /// converted to 8-bit premultiplied sRGB.
+    static func pixel(of image: CGImage, x: Int, y: Int) -> RGBA {
+        precondition((0..<image.width).contains(x) && (0..<image.height).contains(y), "(\(x), \(y)) is outside the image")
+        var bytes: [UInt8] = [0, 0, 0, 0]
+        bytes.withUnsafeMutableBytes { buffer in
+            let context = CGContext(
+                data: buffer.baseAddress, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
+                space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            )!
+            // Shift the image so the wanted pixel covers the context's only pixel.
+            // CoreGraphics counts rows from the bottom.
+            context.interpolationQuality = .none
+            context.draw(image, in: CGRect(x: -x, y: y + 1 - image.height, width: image.width, height: image.height))
+        }
+        return RGBA(r: bytes[0], g: bytes[1], b: bytes[2], a: bytes[3])
+    }
+
     private static func storedPixels(of url: URL) throws -> CGImage {
         let source = try #require(CGImageSourceCreateWithURL(url as CFURL, nil))
         return try #require(CGImageSourceCreateImageAtIndex(source, 0, nil))
