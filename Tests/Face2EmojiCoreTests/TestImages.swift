@@ -15,9 +15,14 @@ enum TestImages {
         return url
     }
 
-    /// Writes a JPEG of solid `gray` to a temp file with the given properties dictionary.
-    static func writeJPEG(width: Int, height: Int, gray: CGFloat = 0.5, properties: [CFString: Any] = [:]) throws -> URL {
-        let context = try bitmap(width: width, height: height)
+    /// Writes a JPEG of solid sRGB `gray`, its pixels stored in `colorSpace` (RGB or greyscale),
+    /// to a temp file with the given properties dictionary.
+    static func writeJPEG(
+        width: Int, height: Int, gray: CGFloat = 0.5,
+        colorSpace: CGColorSpace = CGColorSpace(name: CGColorSpace.sRGB)!,
+        properties: [CFString: Any] = [:]
+    ) throws -> URL {
+        let context = try bitmap(width: width, height: height, colorSpace: colorSpace)
         context.setFillColor(CGColor(srgbRed: gray, green: gray, blue: gray, alpha: 1))
         context.fill(CGRect(x: 0, y: 0, width: width, height: height))
         return try write(try #require(context.makeImage()), properties: properties)
@@ -78,11 +83,15 @@ enum TestImages {
         return try #require(CGImageSourceCreateImageAtIndex(source, 0, nil))
     }
 
-    private static func bitmap(width: Int, height: Int) throws -> CGContext {
-        let sRGB = try #require(CGColorSpace(name: CGColorSpace.sRGB))
+    /// An opaque 8-bit context; `colorSpace` must be RGB or greyscale.
+    private static func bitmap(
+        width: Int, height: Int, colorSpace: CGColorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+    ) throws -> CGContext {
+        // Greyscale bitmaps have no padding byte to skip.
+        let alpha: CGImageAlphaInfo = colorSpace.model == .monochrome ? .none : .noneSkipLast
         return try #require(CGContext(
             data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
-            space: sRGB, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+            space: colorSpace, bitmapInfo: alpha.rawValue
         ))
     }
 
@@ -93,4 +102,16 @@ enum TestImages {
         try #require(CGImageDestinationFinalize(destination))
         return url
     }
+}
+
+/// A path named `name` in the temp directory that nothing else uses; no file is created.
+func tempURL(_ name: String) -> URL {
+    FileManager.default.temporaryDirectory.appending(path: "\(UUID())-\(name)")
+}
+
+/// A new, empty folder in the temp directory.
+func makeTempFolder() throws -> URL {
+    let folder = FileManager.default.temporaryDirectory.appending(path: "\(UUID())", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+    return folder
 }
