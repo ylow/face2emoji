@@ -5,11 +5,11 @@ import SwiftUI
 /// Transparent AppKit view covering the window. Accepts file promises (Apple Photos) and file URLs (Finder).
 /// Promised files are received into a per-launch temp folder; Finder files are used in place.
 /// Calls `onDrop` once per drag with sources in drag order; `originalName` is the file's last path component.
+/// `failedCount` is the number of promised files that failed to arrive; they are not among the sources.
 ///
-/// Mouse events pass through it to the views underneath: only dragging reaches it. A promised file
-/// that fails to arrive is left out of the sources.
+/// Mouse events pass through it to the views underneath: only dragging reaches it.
 struct DropTargetView: NSViewRepresentable {
-    var onDrop: ([PhotoSource]) -> Void
+    var onDrop: ([PhotoSource], _ failedCount: Int) -> Void
 
     /// Holds a fresh subfolder per drag, so that each promised file keeps the name its source gave it.
     /// Delete it when the app quits; not before, as the photos are read from it until then.
@@ -25,7 +25,7 @@ struct DropTargetView: NSViewRepresentable {
     }
 
     final class DropView: NSView {
-        var onDrop: ([PhotoSource]) -> Void
+        var onDrop: ([PhotoSource], _ failedCount: Int) -> Void
         /// Promised files are read on it: the promise's source may still be writing a file when its
         /// read starts, and that read waits for the write to finish.
         private let promiseQueue: OperationQueue = {
@@ -39,7 +39,7 @@ struct DropTargetView: NSViewRepresentable {
         private static let readableClasses: [AnyClass] = [NSFilePromiseReceiver.self, NSURL.self]
         private static let searchOptions: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
 
-        init(onDrop: @escaping ([PhotoSource]) -> Void) {
+        init(onDrop: @escaping ([PhotoSource], _ failedCount: Int) -> Void) {
             self.onDrop = onDrop
             super.init(frame: .zero)
             let promiseTypes = NSFilePromiseReceiver.readableDraggedTypes.map { NSPasteboard.PasteboardType($0) }
@@ -65,26 +65,33 @@ struct DropTargetView: NSViewRepresentable {
         override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
             let drop = PendingDrop(onDrop: onDrop)
             let queue = promiseQueue
-            var destination: URL?
+            // Every promise of a drag goes to the same folder, made on the first promise.
+            var destination: Result<URL, any Error>?
+            // Without the concurrent option, the block runs synchronously on this, the main, thread.
             sender.enumerateDraggingItems(
                 options: [], for: self, classes: Self.readableClasses, searchOptions: Self.searchOptions
             ) { draggingItem, _, _ in
                 switch draggingItem.item {
                 case let receiver as NSFilePromiseReceiver:
-                    // Every promise of a drag must go to the same folder. Should creating it fail, the
-                    // promised files fail to arrive and are left out.
-                    let folder = destination ?? Self.makeDragFolder()
-                    destination = folder
                     // `fileTypes` has one entry per promised file (one, for each item Photos promises).
                     // Some legacy sources list a type once for several files; files beyond the count
                     // are left out.
-                    let slot = drop.addPromise(of: max(1, receiver.fileTypes.count), from: receiver)
-                    receiver.receivePromisedFiles(atDestination: folder, options: [:], operationQueue: queue) { url, error in
-                        let source = error == nil ? PhotoSource(url: url, originalName: url.lastPathComponent) : nil
-                        Task { @MainActor in drop.receive(source, in: slot) }
+                    let fileCount = max(1, receiver.fileTypes.count)
+                    let made = destination ?? Result { try Self.makeDragFolder() }
+                    destination = made
+                    guard case let .success(folder) = made else {
+                        drop.addFailedPromise(of: fileCount)
+                        break
                     }
-                case let url as URL:
-                    drop.addFile(PhotoSource(url: url, originalName: url.lastPathComponent))
+                    let slot = drop.addPromise(of: fileCount, from: receiver)
+                    receiver.receivePromisedFiles(
+                        atDestination: folder, options: [:], operationQueue: queue,
+                        reader: Self.promiseReader(delivering: drop, slot: slot)
+                    )
+                case let url as NSURL:
+                    // Finder hands over file reference URLs (file:///.file/id=…); name the file by its path.
+                    let fileURL = url.filePathURL ?? (url as URL)
+                    drop.addFile(PhotoSource(url: fileURL, originalName: fileURL.lastPathComponent))
                 default:
                     break
                 }
@@ -92,9 +99,22 @@ struct DropTargetView: NSViewRepresentable {
             return drop.finishAdding()
         }
 
-        private static func makeDragFolder() -> URL {
+        /// Load-bearing: AppKit calls the reader on `promiseQueue`, off the main thread. A closure written
+        /// in this main-actor class would be inferred main-actor isolated (the `reader:` parameter is not
+        /// `@Sendable`), and Swift checks that isolation when it is called: the app would trap on the first
+        /// promised file. Made here, in a nonisolated function, the closure is nonisolated.
+        private nonisolated static func promiseReader(
+            delivering drop: PendingDrop, slot: Int
+        ) -> @Sendable (URL, (any Error)?) -> Void {
+            { url, error in
+                let source = error == nil ? PhotoSource(url: url, originalName: url.lastPathComponent) : nil
+                Task { @MainActor in drop.receive(source, in: slot) }
+            }
+        }
+
+        private static func makeDragFolder() throws -> URL {
             let folder = DropTargetView.promisedFilesFolder.appending(path: UUID().uuidString, directoryHint: .isDirectory)
-            try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
             return folder
         }
     }
@@ -111,14 +131,15 @@ private final class PendingDrop {
         var outstanding = 0
     }
 
-    private let onDrop: ([PhotoSource]) -> Void
+    private let onDrop: ([PhotoSource], _ failedCount: Int) -> Void
     private var slots: [Slot] = []
+    private var failedCount = 0
     /// Kept until the drop is handed over, in case a receiver must outlive its promises.
     private var receivers: [NSFilePromiseReceiver] = []
     private var isAdding = true
     private var isDelivered = false
 
-    init(onDrop: @escaping ([PhotoSource]) -> Void) {
+    init(onDrop: @escaping ([PhotoSource], _ failedCount: Int) -> Void) {
         self.onDrop = onDrop
     }
 
@@ -133,12 +154,22 @@ private final class PendingDrop {
         return slots.count - 1
     }
 
+    /// A promise that could not be called in: its files count as failed.
+    func addFailedPromise(of fileCount: Int) {
+        slots.append(Slot())
+        failedCount += fileCount
+    }
+
     /// One promised file of `slot` arrived (`source`) or failed (nil). Files beyond those expected are
     /// left out, as is any file arriving after the drop was handed over.
     func receive(_ source: PhotoSource?, in slot: Int) {
         guard !isDelivered, slots[slot].outstanding > 0 else { return }
         slots[slot].outstanding -= 1
-        if let source { slots[slot].sources.append(source) }
+        if let source {
+            slots[slot].sources.append(source)
+        } else {
+            failedCount += 1
+        }
         deliverIfComplete()
     }
 
@@ -153,6 +184,6 @@ private final class PendingDrop {
         guard !isAdding, !isDelivered, !slots.isEmpty, slots.allSatisfy({ $0.outstanding == 0 }) else { return }
         isDelivered = true
         receivers = []
-        onDrop(slots.flatMap(\.sources))
+        onDrop(slots.flatMap(\.sources), failedCount)
     }
 }

@@ -1,5 +1,6 @@
 import Face2EmojiCore
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// The window's content: a prompt to drop photos until there are some, then the filmstrip and the
 /// editor. Photos can be dropped anywhere on it; the arrow keys move through them.
@@ -11,7 +12,7 @@ struct ContentView: View {
     var body: some View {
         content
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .overlay { DropTargetView(onDrop: add) }
+            .overlay { DropTargetView(onDrop: add(_:failedCount:)) }
             // Arrow keys reach this handler only when no focused view inside, such as a text field,
             // handles them first.
             .focusable()
@@ -59,11 +60,14 @@ struct ContentView: View {
         Binding(get: { skippedMessage != nil }, set: { if !$0 { skippedMessage = nil } })
     }
 
-    private func add(_ sources: [PhotoSource]) {
+    /// Adds the image files among `sources`; files of other types are ignored without a word. Image files
+    /// that cannot be decoded and `failedCount` (promised files that never arrived) are reported together.
+    private func add(_ sources: [PhotoSource], failedCount: Int) {
+        let images = sources.filter { UTType(filenameExtension: $0.url.pathExtension)?.conforms(to: .image) ?? false }
         // Not a view-bound task: cancelling `add` could leave photos without their faces.
         Task {
-            let skipped = await batch.add(sources)
-            if skipped > 0 { skippedMessage = "\(skipped) item(s) could not be read as photos." }
+            let unreadable = await batch.add(images) + failedCount
+            if unreadable > 0 { skippedMessage = "\(unreadable) item(s) could not be read as photos." }
         }
     }
 
@@ -81,10 +85,11 @@ struct ContentView: View {
     /// FACE2EMOJI_DEBUG_LOAD=<path>:<path>… adds those files at launch, as dropping them would.
     private func addDebugPhotos() {
         guard let paths = ProcessInfo.processInfo.environment["FACE2EMOJI_DEBUG_LOAD"] else { return }
-        add(paths.split(separator: ":").map { path in
+        let sources = paths.split(separator: ":").map { path in
             let url = URL(filePath: String(path))
             return PhotoSource(url: url, originalName: url.lastPathComponent)
-        })
+        }
+        add(sources, failedCount: 0)
     }
     #endif
 }
