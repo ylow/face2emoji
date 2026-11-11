@@ -4,17 +4,45 @@ import Synchronization
 import Testing
 import Face2EmojiCore
 
-/// Reports `faces` for every image.
+/// Reports `faces` for every image, unless the task is cancelled, as Vision does.
 struct StubDetector: FaceDetecting {
     var faces: [DetectedFace] = [DetectedFace(box: CGRect(x: 0.4, y: 0.4, width: 0.2, height: 0.2), roll: nil)]
     /// When set, `detectFaces` waits for one element first. Only one detection may wait on a gate.
     var gate: AsyncStream<Void>? = nil
+    /// When set, `detectFaces` waits until it opens. Any number of detections may wait on it.
+    var latch: Latch? = nil
 
     func detectFaces(in image: CGImage) async throws -> [DetectedFace] {
         if let gate {
             for await _ in gate { break }
         }
+        await latch?.wait()
+        try Task.checkCancellation()
         return faces
+    }
+}
+
+/// Holds everyone who waits until `open()`; after that, waiting returns at once.
+final class Latch: Sendable {
+    private let state = Mutex<(isOpen: Bool, waiting: [CheckedContinuation<Void, Never>])>((false, []))
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            let isOpen = state.withLock { state in
+                if !state.isOpen { state.waiting.append(continuation) }
+                return state.isOpen
+            }
+            if isOpen { continuation.resume() }
+        }
+    }
+
+    func open() {
+        let waiting = state.withLock { state in
+            state.isOpen = true
+            defer { state.waiting = [] }
+            return state.waiting
+        }
+        for continuation in waiting { continuation.resume() }
     }
 }
 
@@ -99,6 +127,37 @@ private func garbageSource(_ name: String) throws -> PhotoSource {
     #expect(detector.peak > 1)      // photos are processed in parallel, not one by one
 }
 
+@MainActor @Test func photoLoadedAfterEveryOtherWasRemovedBecomesCurrent() async throws {
+    let latch = Latch()
+    let batch = Batch(detector: StubDetector(latch: latch))
+    let sources = try (1...5).map { try source("p\($0).jpg", width: 16, height: 16) }
+    let adding = Task { await batch.add(sources) }
+    // Four photos load and their detections hold all four slots, so the fifth cannot load yet.
+    while batch.photos.count < 4 { await Task.yield() }
+    for photo in batch.photos { batch.removePhoto(photo.id) }
+    #expect(batch.photos.isEmpty && batch.currentPhotoID == nil)
+    latch.open()
+    _ = await adding.value
+    #expect(batch.photos.map(\.source) == [sources[4]])
+    #expect(batch.currentPhotoID == batch.photos.first?.id)
+    #expect(batch.currentPhotoID != nil)
+}
+
+@MainActor @Test func cancelledDetectionLeavesPhotoDetecting() async throws {
+    let (stream, cont) = AsyncStream<Void>.makeStream()
+    let batch = Batch(detector: StubDetector(gate: stream))
+    let a = try source("a.jpg")
+    let adding = Task { await batch.add([a]) }
+    while batch.photos.isEmpty { await Task.yield() }
+    adding.cancel()
+    _ = await adding.value
+    #expect(batch.photos.count == 1)
+    #expect(batch.photos[0].isDetecting)
+    #expect(batch.photos[0].placements.isEmpty)
+    #expect(!batch.isBusy)
+    cont.finish()
+}
+
 @MainActor @Test func secondAddAppendsAndKeepsCurrent() async throws {
     let batch = Batch(detector: StubDetector())
     try await batch.add([source("a.jpg")])
@@ -157,6 +216,24 @@ private func garbageSource(_ name: String) throws -> PhotoSource {
     undoManager.undo()
     #expect(batch.photos.map(\.id) == [id])
     #expect(batch.currentPhotoID == id)
+    #expect(!batch.photos[0].isDetecting)
+    #expect(batch.photos[0].placements.map(\.emoji) == ["😀"])
+}
+
+@MainActor @Test func undoingRemovalBeforeDetectionFinishesStillGetsDetectedEmoji() async throws {
+    let (stream, cont) = AsyncStream<Void>.makeStream()
+    let undoManager = manualUndoManager()
+    let batch = Batch(detector: StubDetector(gate: stream))
+    batch.undoManager = undoManager
+    let a = try source("a.jpg")
+    let adding = Task { await batch.add([a]) }
+    while batch.photos.isEmpty { await Task.yield() }
+    let id = batch.photos[0].id
+    asOneEvent(undoManager) { batch.removePhoto(id) }
+    undoManager.undo()
+    #expect(batch.photos.map(\.id) == [id])
+    #expect(batch.photos[0].isDetecting)
+    cont.yield(); _ = await adding.value
     #expect(!batch.photos[0].isDetecting)
     #expect(batch.photos[0].placements.map(\.emoji) == ["😀"])
 }
@@ -242,6 +319,27 @@ private func garbageSource(_ name: String) throws -> PhotoSource {
     asOneEvent(undoManager) { batch.update(replaced, in: photoID) }
     #expect(batch.photos[0].placements == [replaced])
     #expect(undoManager.undoActionName == "Change Emoji")
+}
+
+@MainActor @Test func undoAndRedoOfEmojiEditShowTheEditedPhoto() async throws {
+    let undoManager = manualUndoManager()
+    let batch = Batch(detector: StubDetector())
+    batch.undoManager = undoManager
+    try await batch.add([source("a.jpg"), source("b.jpg")])
+    let (a, b) = (batch.photos[0].id, batch.photos[1].id)
+    let before = batch.photos[0].placements
+    asOneEvent(undoManager) { batch.addEmoji() }
+    let after = batch.photos[0].placements
+
+    batch.currentPhotoID = b
+    undoManager.undo()
+    #expect(batch.currentPhotoID == a)
+    #expect(batch.photos[0].placements == before)
+
+    batch.currentPhotoID = b
+    undoManager.redo()
+    #expect(batch.currentPhotoID == a)
+    #expect(batch.photos[0].placements == after)
 }
 
 @MainActor @Test func removePhotoMovesCurrentAndUndoRestoresPosition() async throws {

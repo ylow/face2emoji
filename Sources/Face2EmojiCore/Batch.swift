@@ -83,9 +83,12 @@ public final class Batch {
     /// `isDetecting` set; detection then runs on a copy with longest side ≤ 4096 px and places
     /// `defaultEmoji` — as it is when that detection finishes — on each face. A photo removed
     /// before its detection finishes does not get the result unless the removal is undone.
-    /// Undecodable sources are skipped. If nothing is current, the photo of the first decodable
-    /// source becomes current once it has loaded.
+    /// Undecodable sources are skipped. Whenever nothing is current, the call's earliest photo
+    /// becomes current as soon as no earlier source of the call is still loading, so the first
+    /// decodable source's photo is picked whatever the load order.
     /// At most 4 photos are processed at once; overlapping calls take turns, in call order.
+    /// Await it from a task that is not cancelled. Cancelling does not stop loading, but it may
+    /// cut detection short; such a photo keeps `isDetecting` set rather than appearing to have no faces.
     /// Returns the number of sources skipped. Not undoable.
     @discardableResult
     public func add(_ sources: [PhotoSource]) async -> Int {
@@ -101,22 +104,17 @@ public final class Batch {
 
     private func intake(_ sources: [PhotoSource], firstSequence: Int) async -> Int {
         var skipped = 0
-        // If nothing is current, the first decodable source's photo becomes current, so the pick
-        // waits until every source before it has turned out undecodable, whatever the load order.
-        var outcomes = [SourceOutcome](repeating: .loading, count: sources.count)
-        var firstUndecided = 0
-        func pickCurrentPhoto() {
-            while firstUndecided < outcomes.count {
-                switch outcomes[firstUndecided] {
-                case .loading:
-                    return
-                case .skipped:
-                    firstUndecided += 1
-                case .added(let id):
-                    if currentPhotoID == nil, photoIndex(id) != nil { currentPhotoID = id }
-                    firstUndecided = outcomes.count
-                }
-            }
+        let ownSequences = firstSequence..<(firstSequence + sources.count)
+        var isLoading = [Bool](repeating: true, count: sources.count)
+        var firstLoading = 0
+        /// Run after each source finishes loading or fails to.
+        func pickCurrentPhotoIfNone() {
+            while firstLoading < isLoading.count, !isLoading[firstLoading] { firstLoading += 1 }
+            guard currentPhotoID == nil,
+                  let earliest = photos.first(where: { ownSequences.contains($0.sequence) }),
+                  earliest.sequence - firstSequence < firstLoading
+            else { return }
+            currentPhotoID = earliest.id
         }
 
         await withTaskGroup(of: IntakeStep.self) { group in
@@ -140,8 +138,8 @@ public final class Batch {
                         placements: [], isDetecting: true, sequence: firstSequence + index
                     )
                     insert(photo)
-                    outcomes[index] = .added(photo.id)
-                    pickCurrentPhoto()
+                    isLoading[index] = false
+                    pickCurrentPhotoIfNone()
                     // The load's slot passes to this photo's detection.
                     let detector = detector, id = photo.id, url = photo.source.url, size = photo.pixelSize
                     group.addTask {
@@ -149,8 +147,8 @@ public final class Batch {
                     }
                 case let .undecodable(index):
                     skipped += 1
-                    outcomes[index] = .skipped
-                    pickCurrentPhoto()
+                    isLoading[index] = false
+                    pickCurrentPhotoIfNone()
                     loadNextSource()
                 case let .detected(id, imageSize, faces):
                     finishDetection(of: id, imageSize: imageSize, faces: faces)
@@ -161,8 +159,10 @@ public final class Batch {
         return skipped
     }
 
-    /// Applied directly, not as an undo step.
-    private func finishDetection(of id: PhotoItem.ID, imageSize: CGSize, faces: [DetectedFace]) {
+    /// Applied directly, not as an undo step. `faces` is nil when cancellation cut detection
+    /// short: the photo then stays `isDetecting`.
+    private func finishDetection(of id: PhotoItem.ID, imageSize: CGSize, faces: [DetectedFace]?) {
+        guard let faces else { return }
         let detected = faces.map { FacePlacement.placement(for: $0, imageSize: imageSize, emoji: defaultEmoji) }
         if let index = photoIndex(id) {
             photos[index].placements += detected
@@ -249,7 +249,8 @@ public final class Batch {
     }
 
     /// Makes the placement `id` of the photo be `placement` (nil: absent) and registers the
-    /// inverse, which registers redo in turn. A placement that was absent goes in at
+    /// inverse, which registers redo in turn. Undo and redo first make the photo current, so a
+    /// change is never applied out of sight. A placement that was absent goes in at
     /// `insertionIndex`, clamped, or at the end. The undo snapshot is this one placement rather
     /// than the photo's whole list, so emoji detected between an edit and its undo survive the undo.
     private func setPlacement(_ id: EmojiPlacement.ID, to placement: EmojiPlacement?, at insertionIndex: Int? = nil,
@@ -267,6 +268,7 @@ public final class Batch {
         photos[index].placements = placements
         if placement == nil, selectedEmojiID == id { selectedEmojiID = nil }
         undoManager?.registerUndo(withTarget: self) { batch in
+            if batch.currentPhotoID != photoID, batch.photoIndex(photoID) != nil { batch.currentPhotoID = photoID }
             batch.setPlacement(id, to: old, at: oldIndex, in: photoID, actionName: actionName)
         }
         undoManager?.setActionName(actionName)
@@ -300,16 +302,12 @@ public final class Batch {
     }
 }
 
-/// What a source has come to so far in one `add` call.
-private enum SourceOutcome {
-    case loading, skipped, added(PhotoItem.ID)
-}
-
 /// What a child task of `Batch.add` reports back to the main actor.
 private enum IntakeStep: Sendable {
     case loaded(sourceIndex: Int, PhotoIntake.Loaded)
     case undecodable(sourceIndex: Int)
-    case detected(PhotoItem.ID, imageSize: CGSize, faces: [DetectedFace])
+    /// `faces` is nil when cancellation cut detection short.
+    case detected(PhotoItem.ID, imageSize: CGSize, faces: [DetectedFace]?)
 }
 
 /// The steps of adding a photo that run off the main actor.
@@ -331,9 +329,15 @@ private enum PhotoIntake {
         return Loaded(pixelSize: pixelSize, thumbnail: thumbnail)
     }
 
-    /// Faces on a copy with longest side ≤ 4096 px; none if that copy cannot be loaded or detection fails.
-    @concurrent static func detectFaces(in url: URL, using detector: any FaceDetecting) async -> [DetectedFace] {
+    /// Faces on a copy with longest side ≤ 4096 px; none if that copy cannot be loaded or detection
+    /// fails; nil if detection failed because the task was cancelled, so that the photo is not
+    /// taken to have no faces.
+    @concurrent static func detectFaces(in url: URL, using detector: any FaceDetecting) async -> [DetectedFace]? {
         guard let image = try? ImageLoader.loadUpright(url, maxPixelSize: detectionMaxPixelSize) else { return [] }
-        return (try? await detector.detectFaces(in: image)) ?? []
+        do {
+            return try await detector.detectFaces(in: image)
+        } catch {
+            return Task.isCancelled ? nil : []
+        }
     }
 }
