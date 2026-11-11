@@ -1,1 +1,5 @@
 .superpowers/
+.build/
+build/
+Face2Emoji.xcodeproj/
+.swiftpm/
