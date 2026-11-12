@@ -6,6 +6,10 @@ then move, resize, replace, add or delete. Export All… writes every photo as a
 choose, with the emoji drawn in and location and other identifying metadata left out, and never overwrites a file
 already there.
 
+![Face2Emoji with the Apollo 11 crew photo: an emoji covers each astronaut's head](docs/images/screenshot.png)
+
+<sub>Photo: Apollo 11 crew, NASA S69-31739, public domain.</sub>
+
 ## Build and run
 
 You need macOS 15 or later, Xcode 27 (Swift 6.4) and [XcodeGen](https://github.com/yonaskolb/XcodeGen)
