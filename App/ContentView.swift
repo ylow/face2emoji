@@ -3,24 +3,42 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 /// The window's content: a prompt to drop photos until there are some, then the filmstrip and the
-/// editor. Photos can be dropped anywhere on it; the arrow keys move through them.
+/// editor. Photos can be dropped anywhere on it; the arrow keys move through them, and Delete removes
+/// the selected emoji, or the current photo when no emoji is selected.
 struct ContentView: View {
     @Environment(Batch.self) private var batch
     @State private var skippedMessage: String?
     @FocusState private var isFocused: Bool
 
+    /// The key labelled "delete" (⌫) on a Mac keyboard. It reaches `onKeyPress` as U+007F, not as
+    /// `KeyEquivalent.delete` (U+0008).
+    private static let backspace = KeyEquivalent("\u{7F}")
+
     var body: some View {
         content
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .overlay { DropTargetView(onDrop: add(_:failedCount:)) }
-            // Arrow keys reach this handler only when no focused view inside, such as a text field,
+            // Keys reach these handlers only when no focused view inside, such as a text field,
             // handles them first.
             .focusable()
             .focusEffectDisabled()
             .focused($isFocused)
             .defaultFocus($isFocused, true)
             .onKeyPress(keys: [.leftArrow, .upArrow, .rightArrow, .downArrow], action: navigate)
+            // Not on key repeat: once the selected emoji is gone, a held key would remove photo after photo.
+            .onKeyPress(keys: [Self.backspace, .delete, .deleteForward], phases: .down, action: delete)
             .toolbar {
+                ToolbarItemGroup(placement: .primaryAction) {
+                    Button("Add Emoji") { batch.addEmoji() }
+                        .disabled(batch.currentPhoto == nil)
+                    Menu {
+                        ForEach(EmojiCatalog.all, id: \.self) { emoji in
+                            Button(emoji) { batch.defaultEmoji = emoji }
+                        }
+                    } label: {
+                        Text("Default: \(batch.defaultEmoji)")
+                    }
+                }
                 if let position {
                     ToolbarItem(placement: .status) {
                         Text(position).monospacedDigit()
@@ -77,6 +95,18 @@ struct ContentView: View {
         switch press.key {
         case .leftArrow, .upArrow: batch.selectPreviousPhoto()
         default: batch.selectNextPhoto()
+        }
+        return .handled
+    }
+
+    private func delete(_ press: KeyPress) -> KeyPress.Result {
+        guard press.modifiers.isDisjoint(with: [.command, .option, .control, .shift]) else { return .ignored }
+        if batch.selectedEmojiID != nil {
+            batch.deleteSelectedEmoji()
+        } else if let current = batch.currentPhotoID {
+            batch.removePhoto(current)
+        } else {
+            return .ignored
         }
         return .handled
     }
