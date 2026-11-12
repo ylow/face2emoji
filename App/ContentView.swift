@@ -4,10 +4,12 @@ import UniformTypeIdentifiers
 
 /// The window's content: a prompt to drop photos until there are some, then the filmstrip and the
 /// editor. Photos can be dropped anywhere on it; the arrow keys move through them, and Delete removes
-/// the selected emoji, or the current photo when no emoji is selected.
+/// the selected emoji, or the current photo when no emoji is selected. Neither key acts while an
+/// export is running or its result is showing.
 struct ContentView: View {
     @Environment(Batch.self) private var batch
     @State private var skippedMessage: String?
+    @State private var exportFlow = ExportFlow()
     @FocusState private var isFocused: Bool
 
     /// The key labelled "delete" (⌫) on a Mac keyboard. It reaches `onKeyPress` as U+007F, not as
@@ -37,6 +39,9 @@ struct ContentView: View {
                     } label: {
                         Text("Default: \(batch.defaultEmoji)")
                     }
+                    Button("Export All…") { exportFlow.chooseFolderAndExport(batch) }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!exportFlow.canExport(batch))
                 }
                 if let position {
                     ToolbarItem(placement: .status) {
@@ -45,6 +50,7 @@ struct ContentView: View {
                 }
             }
             .alert(skippedMessage ?? "", isPresented: isShowingSkippedMessage) {}
+            .exportFlow(exportFlow)
             #if DEBUG
             .onAppear(perform: addDebugPhotos)
             #endif
@@ -91,6 +97,8 @@ struct ContentView: View {
     private func navigate(_ press: KeyPress) -> KeyPress.Result {
         // Leave modified arrows to whatever else wants them.
         guard press.modifiers.isDisjoint(with: [.command, .option, .control, .shift]) else { return .ignored }
+        // The export's sheet or alert is up: the batch behind it stays as it is.
+        guard !exportFlow.isActive else { return .ignored }
         switch press.key {
         case .leftArrow, .upArrow: batch.selectPreviousPhoto()
         default: batch.selectNextPhoto()
@@ -100,6 +108,7 @@ struct ContentView: View {
 
     private func delete(_ press: KeyPress) -> KeyPress.Result {
         guard press.modifiers.isDisjoint(with: [.command, .option, .control, .shift]) else { return .ignored }
+        guard !exportFlow.isActive else { return .ignored }
         // A held key deletes once. Its repeats are taken, so that AppKit does not beep, but do nothing:
         // once the selected emoji is gone they would remove photo after photo.
         guard press.phase == .down else { return .handled }
