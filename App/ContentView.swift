@@ -29,6 +29,11 @@ struct ContentView: View {
             .onKeyPress(keys: [.leftArrow, .upArrow, .rightArrow, .downArrow], action: navigate)
             .onKeyPress(keys: [Self.backspace, .delete, .deleteForward], phases: [.down, .repeat], action: delete)
             .toolbar {
+                ToolbarItem(placement: .navigation) {
+                    Button("Clear All") { batch.removeAllPhotos() }
+                        .help("Remove every photo from the filmstrip. Edit ▸ Undo brings them back.")
+                        .disabled(batch.photos.isEmpty || batch.isBusy || exportFlow.isActive)
+                }
                 ToolbarItemGroup(placement: .primaryAction) {
                     Button("Add Emoji") { batch.addEmoji() }
                         .disabled(batch.currentPhoto == nil)
@@ -39,6 +44,17 @@ struct ContentView: View {
                     } label: {
                         Text("Default: \(batch.defaultEmoji)")
                     }
+                    HStack(spacing: 4) {
+                        Text("Faces only").font(.caption).foregroundStyle(.secondary)
+                        Slider(value: headSensitivity, in: 0...1) { Text("Head sensitivity") }
+                            .labelsHidden()
+                            .frame(width: 100)
+                        Text("All heads").font(.caption).foregroundStyle(.secondary)
+                    }
+                    .help("""
+                        How readily a person whose face isn't visible, such as one seen from behind, gets an emoji. \
+                        Lower it if things that aren't people get covered. Applies to photos added from now on.
+                        """)
                     Button("Export All…") { exportFlow.chooseFolderAndExport(batch) }
                         .buttonStyle(.borderedProminent)
                         .disabled(!exportFlow.canExport(batch))
@@ -77,6 +93,14 @@ struct ContentView: View {
             return nil
         }
         return "\(index + 1) of \(batch.photos.count)"
+    }
+
+    /// 1 − the batch's body confidence threshold: 0 covers faces only, 1 every body Vision reports.
+    private var headSensitivity: Binding<Double> {
+        Binding(
+            get: { Double(1 - batch.bodyConfidenceThreshold) },
+            set: { batch.bodyConfidenceThreshold = Float(1 - $0) }
+        )
     }
 
     private var isShowingSkippedMessage: Binding<Bool> {

@@ -54,6 +54,25 @@ enum TestImages {
         return try #require(context.makeImage())
     }
 
+    /// The pixels of `url` with a flat hair-brown ellipse painted over each of `faces` (Vision-style
+    /// boxes), wide enough to hide the ears and tall enough to hide the brows and chin: heads whose
+    /// face cannot be seen, as from behind.
+    static func hidingFaces(_ url: URL, _ faces: [CGRect]) throws -> CGImage {
+        let image = try storedPixels(of: url)
+        let width = CGFloat(image.width), height = CGFloat(image.height)
+        let context = try bitmap(width: image.width, height: image.height)
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        context.setFillColor(CGColor(srgbRed: 0.25, green: 0.18, blue: 0.12, alpha: 1))
+        for face in faces {
+            // CoreGraphics' bottom-left origin matches Vision's.
+            context.fillEllipse(in: CGRect(
+                x: (face.minX - 0.15 * face.width) * width, y: (face.minY - 0.1 * face.height) * height,
+                width: 1.3 * face.width * width, height: 1.5 * face.height * height
+            ))
+        }
+        return try #require(context.makeImage())
+    }
+
     /// One 8-bit sRGB pixel, colour premultiplied by alpha.
     struct RGBA: Equatable, CustomStringConvertible {
         var r, g, b, a: UInt8

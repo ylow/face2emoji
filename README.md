@@ -1,9 +1,10 @@
 # face2emoji
 
 Face2Emoji is a Mac app that covers the faces in your photos with emoji. Drop photos on its window from
-Apple Photos or Finder: it finds the faces and puts an emoji on each, which you can then move, resize, replace,
-add or delete. Export All… writes every photo as a full-size JPEG into a folder you choose, with the emoji drawn
-in and location and other identifying metadata left out, and never overwrites a file already there.
+Apple Photos or Finder: it finds people's heads, faces visible or not, and puts an emoji on each, which you can
+then move, resize, replace, add or delete. Export All… writes every photo as a full-size JPEG into a folder you
+choose, with the emoji drawn in and location and other identifying metadata left out, and never overwrites a file
+already there.
 
 ## Build and run
 
@@ -54,7 +55,7 @@ These need a real screen, a real Apple Photos library and Finder, so they cannot
    change photo and Delete still deletes the selected emoji, or the photo when no emoji is selected.
 6. **Picker.** Escape closes the emoji picker.
 7. **Undo.** Edit ▸ Undo and Edit ▸ Redo show the action names (Change Emoji, Add Emoji, Delete Emoji, Remove
-   Photo), and Cmd-Z and Shift-Cmd-Z work.
+   Photo, Remove All Photos), and Cmd-Z and Shift-Cmd-Z work. Clear All is disabled while photos are loading.
 8. **Dragged emoji are exported where they were dragged.** Drag a photo's emoji somewhere else, export, and open
    the exported file: the emoji is at the dragged position.
 9. **Export All… button.** It is drawn as the prominent (accent-coloured) button while the window is active, and
@@ -66,3 +67,5 @@ These need a real screen, a real Apple Photos library and Finder, so they cannot
     photo onto the window behind it. Either the drop is refused, or the photo is added and choosing a folder
     then exports nothing (Export All… works again once the photo has loaded). Nothing is exported while a photo
     is still being scanned for faces.
+12. **Heads without faces.** Drop a photo of someone seen from behind or in sharp profile: their head gets an
+    emoji. Drag the toolbar slider to "Faces only" and drop the photo again: only people whose face shows get one.

@@ -109,12 +109,19 @@ One window.
 - Runs automatically in the background for each photo as it is added. The
   window stays responsive, and photos become viewable as soon as they load.
 - A thumbnail shows a progress indicator until its detection has finished.
-- Each detected face gets one emoji, the current default emoji.
-- **(my call)** Placement: the emoji is centred on the detected face and sized
-  larger than the detected face box so that it covers the whole head area
-  rather than only eyes-to-chin. A starting factor of about 1.4× the larger
-  side of the face box is suggested; the builder should tune this against
-  real photos, erring toward too large.
+- **(decided)** Each detected head gets one emoji, the current default emoji,
+  covering the whole head, hair and ears included, not only the face.
+- Heads are found two ways: by face (Vision face rectangles) and by upper body
+  (Vision human rectangles), so that people whose face cannot be seen, such as
+  those seen from behind, are covered too. A body whose head already has a
+  face's emoji gets no second one.
+- **(decided)** A toolbar slider, "Faces only" to "All heads", sets how sure
+  Vision must be of a body before its head is covered; it applies to photos
+  added from then on. It starts at "All heads": Vision reports no low-confidence
+  bodies of its own, so any cutoff only drops people.
+- Placement from a face: centred above the face box's centre and 2.1× its
+  larger side. From a body: hanging from the box's top edge (the crown),
+  0.9× the box's width, upright. Tuned on the fixtures, erring toward too large.
 - **(my call)** The emoji is tilted to match the head's roll angle when
   detection reports one.
 - Image orientation metadata must be respected so that faces are found in

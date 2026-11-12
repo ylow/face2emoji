@@ -4,21 +4,22 @@ import Synchronization
 import Testing
 import Face2EmojiCore
 
-/// Reports `faces` for every image, unless the task is cancelled, as Vision does.
-struct StubDetector: FaceDetecting {
+/// Reports `faces` and `bodies` for every image, unless the task is cancelled, as Vision does.
+struct StubDetector: HeadDetecting {
     var faces: [DetectedFace] = [DetectedFace(box: CGRect(x: 0.4, y: 0.4, width: 0.2, height: 0.2), roll: nil)]
-    /// When set, `detectFaces` waits for one element first. Only one detection may wait on a gate.
+    var bodies: [DetectedBody] = []
+    /// When set, `detect` waits for one element first. Only one detection may wait on a gate.
     var gate: AsyncStream<Void>? = nil
-    /// When set, `detectFaces` waits until it opens. Any number of detections may wait on it.
+    /// When set, `detect` waits until it opens. Any number of detections may wait on it.
     var latch: Latch? = nil
 
-    func detectFaces(in image: CGImage) async throws -> [DetectedFace] {
+    func detect(in image: CGImage) async throws -> Detection {
         if let gate {
             for await _ in gate { break }
         }
         await latch?.wait()
         try Task.checkCancellation()
-        return faces
+        return Detection(faces: faces, bodies: bodies)
     }
 }
 
@@ -46,16 +47,16 @@ final class Latch: Sendable {
     }
 }
 
-/// Finds no faces, slowly, and records the most detections ever running at once.
-private final class CountingDetector: FaceDetecting {
+/// Finds no one, slowly, and records the most detections ever running at once.
+private final class CountingDetector: HeadDetecting {
     private let counts = Mutex((running: 0, peak: 0))
     var peak: Int { counts.withLock { $0.peak } }
 
-    func detectFaces(in image: CGImage) async throws -> [DetectedFace] {
+    func detect(in image: CGImage) async throws -> Detection {
         counts.withLock { $0.running += 1; $0.peak = max($0.peak, $0.running) }
         defer { counts.withLock { $0.running -= 1 } }
         try await Task.sleep(for: .milliseconds(20))
-        return []
+        return Detection()
     }
 }
 
@@ -188,6 +189,31 @@ private func garbageSource(_ name: String) throws -> PhotoSource {
     batch.defaultEmoji = "🤖"
     cont.yield(); _ = await adding.value
     #expect(batch.photos[0].placements.map(\.emoji) == ["🤖"])
+}
+
+/// A face and, far from it, a body of confidence 0.5 whose face was not found.
+private let faceAndFacelessBody = StubDetector(bodies: [DetectedBody(box: CGRect(x: 0.05, y: 0.1, width: 0.2, height: 0.5), confidence: 0.5)])
+
+@MainActor @Test func bodyThresholdAppliesToLaterPhotosOnly() async throws {
+    let batch = Batch(detector: faceAndFacelessBody)
+    try await batch.add([source("a.jpg")])
+    batch.bodyConfidenceThreshold = 0.6
+    try await batch.add([source("b.jpg")])
+    #expect(batch.photos[0].placements.count == 2)
+    #expect(batch.photos[1].placements.count == 1)
+}
+
+@MainActor @Test func bodyThresholdIsReadWhenDetectionFinishes() async throws {
+    let (stream, cont) = AsyncStream<Void>.makeStream()
+    var detector = faceAndFacelessBody
+    detector.gate = stream
+    let batch = Batch(detector: detector)
+    let a = try source("a.jpg")
+    let adding = Task { await batch.add([a]) }
+    while batch.photos.isEmpty { await Task.yield() }
+    batch.bodyConfidenceThreshold = 1
+    cont.yield(); _ = await adding.value
+    #expect(batch.photos[0].placements.count == 1)
 }
 
 @MainActor @Test func removeDuringDetectionDiscardsResult() async throws {
@@ -370,6 +396,61 @@ private func garbageSource(_ name: String) throws -> PhotoSource {
     asOneEvent(undoManager) { batch.removePhoto(a) }
     #expect(batch.photos.isEmpty)
     #expect(batch.currentPhotoID == nil)
+}
+
+@MainActor @Test func removeAllPhotosEmptiesTheBatchAndUndoRestoresIt() async throws {
+    let undoManager = manualUndoManager()
+    let batch = Batch(detector: StubDetector())
+    batch.undoManager = undoManager
+    try await batch.add([source("a.jpg"), source("b.jpg"), source("c.jpg")])
+    let ids = batch.photos.map(\.id)
+    batch.currentPhotoID = ids[1]
+    asOneEvent(undoManager) { batch.addEmoji() }
+    let placements = batch.photos.map(\.placements)
+
+    asOneEvent(undoManager) { batch.removeAllPhotos() }
+    #expect(batch.photos.isEmpty)
+    #expect(batch.currentPhotoID == nil)
+    #expect(undoManager.undoActionName == "Remove All Photos")
+
+    undoManager.undo()
+    #expect(batch.photos.map(\.id) == ids)
+    #expect(batch.photos.map(\.placements) == placements)
+    #expect(batch.currentPhotoID == ids[1])
+
+    undoManager.redo()
+    #expect(batch.photos.isEmpty)
+    #expect(batch.currentPhotoID == nil)
+}
+
+@MainActor @Test func undoingRemoveAllKeepsPhotosAddedSinceAndRedoRemovesOnlyTheOldOnes() async throws {
+    let undoManager = manualUndoManager()
+    let batch = Batch(detector: StubDetector())
+    batch.undoManager = undoManager
+    try await batch.add([source("a.jpg"), source("b.jpg")])
+    let old = batch.photos.map(\.id)
+    asOneEvent(undoManager) { batch.removeAllPhotos() }
+    try await batch.add([source("c.jpg")])
+    let new = batch.photos.map(\.id)
+
+    undoManager.undo()
+    #expect(batch.photos.map(\.id) == old + new)    // source order: a and b were given first
+    #expect(batch.currentPhotoID == old[0])
+
+    undoManager.redo()
+    #expect(batch.photos.map(\.id) == new)
+    #expect(batch.currentPhotoID == new[0])
+}
+
+@MainActor @Test func removeAllPhotosDoesNothingWhileBusy() async throws {
+    let (stream, cont) = AsyncStream<Void>.makeStream()
+    let batch = Batch(detector: StubDetector(gate: stream))
+    let a = try source("a.jpg")
+    let adding = Task { await batch.add([a]) }
+    while batch.photos.isEmpty { await Task.yield() }
+    batch.removeAllPhotos()
+    #expect(batch.photos.count == 1)
+    cont.yield(); _ = await adding.value
 }
 
 @MainActor @Test func navigationClampsAndClearsSelection() async throws {

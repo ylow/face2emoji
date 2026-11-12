@@ -24,7 +24,7 @@ public struct PhotoItem: Identifiable {
     /// Upright; longest side ≤ 320 px.
     public let thumbnail: CGImage
     public var placements: [EmojiPlacement]
-    /// Face detection has not finished yet.
+    /// Head detection has not finished yet.
     public var isDetecting: Bool
     /// Position of the photo's source among all sources ever given to the batch; `photos` is
     /// kept sorted by it.
@@ -32,7 +32,7 @@ public struct PhotoItem: Identifiable {
 }
 
 /// The photos being worked on and every edit to them. State changes only on the main actor;
-/// loading and face detection run off it.
+/// loading and head detection run off it.
 @MainActor @Observable
 public final class Batch {
     public private(set) var photos: [PhotoItem] = []
@@ -42,8 +42,12 @@ public final class Batch {
     }
     /// An emoji of the current photo. Cleared when that emoji is removed by any edit or undo.
     public var selectedEmojiID: EmojiPlacement.ID?
-    /// Placed on newly detected faces and by `addEmoji()`; changing it leaves placed emoji alone.
+    /// Placed on newly detected heads and by `addEmoji()`; changing it leaves placed emoji alone.
     public var defaultEmoji = EmojiCatalog.defaultEmoji
+    /// A head found only by its upper body, its face unseen, gets an emoji when the body's confidence
+    /// is above this (see `HeadPlacement.placements`): lower covers more such heads, and more things
+    /// that are not heads; 1 covers faces only. Changing it leaves placed emoji alone.
+    public var bodyConfidenceThreshold = HeadPlacement.defaultBodyConfidenceThreshold
     /// Receives every undoable edit; nil makes edits not undoable.
     public var undoManager: UndoManager?
 
@@ -52,7 +56,7 @@ public final class Batch {
     }
 
     /// Some `add` call has not returned: its photos are still waiting their turn, loading or being
-    /// scanned for faces.
+    /// scanned for heads.
     public var isBusy: Bool { activeAdds > 0 }
 
     /// One job per photo, in photo order.
@@ -62,7 +66,7 @@ public final class Batch {
 
     private static let maxConcurrentPhotos = 4
 
-    private let detector: any FaceDetecting
+    private let detector: any HeadDetecting
     /// `add` calls that have not returned, including those waiting for their turn.
     private var activeAdds = 0
     @ObservationIgnored private var nextSequence = 0
@@ -72,7 +76,7 @@ public final class Batch {
     /// brings the photo back.
     @ObservationIgnored private var detectedWhileRemoved: [PhotoItem.ID: [EmojiPlacement]] = [:]
 
-    public init(detector: any FaceDetecting = VisionFaceDetector()) {
+    public init(detector: any HeadDetecting = VisionHeadDetector()) {
         self.detector = detector
     }
 
@@ -81,14 +85,15 @@ public final class Batch {
     /// Loads `sources` and appends their photos in the order given, even when a later source
     /// finishes loading first. Each photo appears as soon as its thumbnail has loaded, with
     /// `isDetecting` set; detection then runs on a copy with longest side ≤ 4096 px and places
-    /// `defaultEmoji` — as it is when that detection finishes — on each face. A photo removed
+    /// `defaultEmoji` on each head found, using `defaultEmoji` and `bodyConfidenceThreshold` as they
+    /// are when that detection finishes. A photo removed
     /// before its detection finishes does not get the result unless the removal is undone.
     /// Undecodable sources are skipped. Whenever nothing is current, the call's earliest photo
     /// becomes current as soon as no earlier source of the call is still loading, so the first
     /// decodable source's photo is picked whatever the load order.
     /// At most 4 photos are processed at once; overlapping calls take turns, in call order.
     /// Await it from a task that is not cancelled. Cancelling does not stop loading, but it may
-    /// cut detection short; such a photo keeps `isDetecting` set rather than appearing to have no faces.
+    /// cut detection short; such a photo keeps `isDetecting` set rather than appearing to have no one in it.
     /// Returns the number of sources skipped. Not undoable.
     @discardableResult
     public func add(_ sources: [PhotoSource]) async -> Int {
@@ -143,15 +148,15 @@ public final class Batch {
                     // The load's slot passes to this photo's detection.
                     let detector = detector, id = photo.id, url = photo.source.url, size = photo.pixelSize
                     group.addTask {
-                        .detected(id, imageSize: size, faces: await PhotoIntake.detectFaces(in: url, using: detector))
+                        .detected(id, imageSize: size, await PhotoIntake.detect(in: url, using: detector))
                     }
                 case let .undecodable(index):
                     skipped += 1
                     isLoading[index] = false
                     pickCurrentPhotoIfNone()
                     loadNextSource()
-                case let .detected(id, imageSize, faces):
-                    finishDetection(of: id, imageSize: imageSize, faces: faces)
+                case let .detected(id, imageSize, detection):
+                    finishDetection(of: id, imageSize: imageSize, detection)
                     loadNextSource()
                 }
             }
@@ -159,11 +164,13 @@ public final class Batch {
         return skipped
     }
 
-    /// Applied directly, not as an undo step. `faces` is nil when cancellation cut detection
+    /// Applied directly, not as an undo step. `detection` is nil when cancellation cut detection
     /// short: the photo then stays `isDetecting`.
-    private func finishDetection(of id: PhotoItem.ID, imageSize: CGSize, faces: [DetectedFace]?) {
-        guard let faces else { return }
-        let detected = faces.map { FacePlacement.placement(for: $0, imageSize: imageSize, emoji: defaultEmoji) }
+    private func finishDetection(of id: PhotoItem.ID, imageSize: CGSize, _ detection: Detection?) {
+        guard let detection else { return }
+        let detected = HeadPlacement.placements(
+            for: detection, imageSize: imageSize, emoji: defaultEmoji, bodyConfidenceThreshold: bodyConfidenceThreshold
+        )
         if let index = photoIndex(id) {
             photos[index].placements += detected
             photos[index].isDetecting = false
@@ -203,6 +210,35 @@ public final class Batch {
         }
         undoManager?.registerUndo(withTarget: self) { $0.restore(photo) }
         undoManager?.setActionName("Remove Photo")
+    }
+
+    /// Undoable. Removes every photo, leaving none current. Does nothing while `isBusy`: photos still
+    /// being added would turn up after it.
+    public func removeAllPhotos() {
+        guard !isBusy else { return }
+        removePhotos(Set(photos.map(\.id)))
+    }
+
+    /// Removes the photos `ids` names and registers their return. Should the current photo go, the first
+    /// photo left, if any, becomes current. Redoing `removeAllPhotos` lands here with only the photos it
+    /// removed, so that photos added since stay.
+    private func removePhotos(_ ids: Set<PhotoItem.ID>) {
+        let removed = photos.filter { ids.contains($0.id) }
+        guard !removed.isEmpty else { return }
+        let current = currentPhotoID
+        photos.removeAll { ids.contains($0.id) }
+        if let current, ids.contains(current) { currentPhotoID = photos.first?.id }
+        undoManager?.registerUndo(withTarget: self) { $0.restore(removed, current: current) }
+        undoManager?.setActionName("Remove All Photos")
+    }
+
+    /// Undoes `removePhotos`: the photos come back in source order, among any added since, and the
+    /// photo that was current when they went becomes current again, else the first of them.
+    private func restore(_ removed: [PhotoItem], current: PhotoItem.ID?) {
+        for photo in removed { insert(photo) }
+        currentPhotoID = removed.contains { $0.id == current } ? current : removed[0].id
+        undoManager?.registerUndo(withTarget: self) { $0.removePhotos(Set(removed.map(\.id))) }
+        undoManager?.setActionName("Remove All Photos")
     }
 
     /// Undoes `removePhoto`: the photo comes back with its placements, in source order, and becomes
@@ -306,8 +342,8 @@ public final class Batch {
 private enum IntakeStep: Sendable {
     case loaded(sourceIndex: Int, PhotoIntake.Loaded)
     case undecodable(sourceIndex: Int)
-    /// `faces` is nil when cancellation cut detection short.
-    case detected(PhotoItem.ID, imageSize: CGSize, faces: [DetectedFace]?)
+    /// nil when cancellation cut detection short.
+    case detected(PhotoItem.ID, imageSize: CGSize, Detection?)
 }
 
 /// The steps of adding a photo that run off the main actor.
@@ -329,15 +365,15 @@ private enum PhotoIntake {
         return Loaded(pixelSize: pixelSize, thumbnail: thumbnail)
     }
 
-    /// Faces on a copy with longest side ≤ 4096 px; none if that copy cannot be loaded or detection
-    /// fails; nil if detection failed because the task was cancelled, so that the photo is not
-    /// taken to have no faces.
-    @concurrent static func detectFaces(in url: URL, using detector: any FaceDetecting) async -> [DetectedFace]? {
-        guard let image = try? ImageLoader.loadUpright(url, maxPixelSize: detectionMaxPixelSize) else { return [] }
+    /// Detection on a copy with longest side ≤ 4096 px; nothing found if that copy cannot be loaded or
+    /// detection fails; nil if detection failed because the task was cancelled, so that the photo is
+    /// not taken to have no one in it.
+    @concurrent static func detect(in url: URL, using detector: any HeadDetecting) async -> Detection? {
+        guard let image = try? ImageLoader.loadUpright(url, maxPixelSize: detectionMaxPixelSize) else { return Detection() }
         do {
-            return try await detector.detectFaces(in: image)
+            return try await detector.detect(in: image)
         } catch {
-            return Task.isCancelled ? nil : []
+            return Task.isCancelled ? nil : Detection()
         }
     }
 }
