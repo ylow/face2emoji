@@ -14,6 +14,9 @@ struct EditorView: View {
     @State private var preview: Preview?
     /// From mouse-down to mouse-up.
     @State private var press: Press?
+    /// Whether SwiftUI is following a press. It goes back to false by itself when the gesture ends or
+    /// is cancelled; a cancelled gesture never reaches `onEnded`.
+    @GestureState private var isPressing = false
     /// The emoji whose picker is open; it shows while that emoji stays selected.
     @State private var pickerEmojiID: EmojiPlacement.ID?
 
@@ -28,8 +31,22 @@ struct EditorView: View {
         var target: Target
         /// The pointer has gone more than `dragThreshold` from `start`: a drag, not a click.
         var isDrag = false
-        /// The emoji as the drag has made it so far. The batch is left alone until mouse-up.
+        /// The emoji as the drag has made it so far, from the emoji as it was at mouse-down. Only its
+        /// dragged field counts; see `dragged(in:)`. The batch is left alone until mouse-up.
         var draft: EmojiPlacement?
+
+        /// The dragged emoji as it is in `placements` now, with only the field the drag changes (the
+        /// centre for a move, the size for a resize) taken from `draft`, so that a change made to it
+        /// meanwhile, such as an undo, is kept. nil if nothing has been dragged or the emoji is gone.
+        func dragged(in placements: [EmojiPlacement]) -> EmojiPlacement? {
+            guard let draft, var placement = placements.first(where: { $0.id == draft.id }) else { return nil }
+            switch target {
+            case .emoji: placement.center = draft.center
+            case .resizeHandle: placement.size = draft.size
+            case .nothing: return nil
+            }
+            return placement
+        }
     }
 
     /// What a press acts on, decided at mouse-down.
@@ -60,6 +77,11 @@ struct EditorView: View {
         // The selection may stick out of the photo, but not out of the editor.
         .clipped()
         .task(id: batch.currentPhotoID) { await loadPreview() }
+        // Once SwiftUI stops following a press, drop it. A press that ended was released in `onEnded`,
+        // which runs first; one that SwiftUI cancelled goes with its draft, having changed nothing.
+        .onChange(of: isPressing) { _, isPressing in
+            if !isPressing { press = nil }
+        }
     }
 
     /// The photo in `geometry.photoFrame`, so that what is drawn and what the pointer hits agree, and
@@ -78,6 +100,7 @@ struct EditorView: View {
         .contentShape(Rectangle())
         .gesture(
             DragGesture(minimumDistance: 0)
+                .updating($isPressing) { _, isPressing, _ in isPressing = true }
                 .onChanged { follow($0, in: geometry) }
                 .onEnded { value in
                     follow(value, in: geometry)
@@ -94,19 +117,23 @@ struct EditorView: View {
             }
             .rotationEffect(.radians(placement.rotation))
             .position(x: square.midX, y: square.midY)
+            // One view, and so one popover, per emoji: closing one emoji's picker cannot touch another's.
+            .id(placement.id)
     }
 
     /// The photo's emoji, the one being dragged where the drag has put it.
     private func shownPlacements(of photo: PhotoItem) -> [EmojiPlacement] {
-        guard let press, press.photoID == photo.id, let draft = press.draft else { return photo.placements }
-        return photo.placements.map { $0.id == draft.id ? draft : $0 }
+        guard let press, press.photoID == photo.id, let dragged = press.dragged(in: photo.placements) else {
+            return photo.placements
+        }
+        return photo.placements.map { $0.id == dragged.id ? dragged : $0 }
     }
 
     // MARK: - Pressing
 
     /// Starts a press at mouse-down, then follows the pointer.
     private func follow(_ value: DragGesture.Value, in geometry: EditorGeometry) {
-        // A new start is a new press, even if SwiftUI cancelled the last one without ending it.
+        // A new start is a new press.
         if press?.start != value.startLocation { press = startPress(at: value.startLocation, in: geometry) }
         guard var press else { return }
         if !press.isDrag, hypot(value.translation.width, value.translation.height) > Self.dragThreshold {
@@ -146,9 +173,9 @@ struct EditorView: View {
         guard let press else { return }
         self.press = nil
         // Another photo became current during the press: nothing of it is in view any more.
-        guard press.photoID == batch.currentPhotoID else { return }
-        if let draft = press.draft {
-            batch.update(draft, in: press.photoID)
+        guard let photo = batch.currentPhoto, photo.id == press.photoID else { return }
+        if let dragged = press.dragged(in: photo.placements) {
+            batch.update(dragged, in: photo.id)
         } else if !press.isDrag, case let .emoji(placement) = press.target {
             pickerEmojiID = placement.id
         }
@@ -156,8 +183,12 @@ struct EditorView: View {
 
     // MARK: - Picker
 
+    /// Closing this emoji's picker leaves a picker since opened for another emoji alone.
     private func isPickerShown(for emojiID: EmojiPlacement.ID) -> Binding<Bool> {
-        Binding(get: { pickerEmojiID == emojiID }, set: { if !$0 { pickerEmojiID = nil } })
+        Binding(
+            get: { pickerEmojiID == emojiID },
+            set: { if !$0, pickerEmojiID == emojiID { pickerEmojiID = nil } }
+        )
     }
 
     private func replace(_ emojiID: EmojiPlacement.ID, with emoji: String) {

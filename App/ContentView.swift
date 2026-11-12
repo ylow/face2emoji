@@ -25,8 +25,7 @@ struct ContentView: View {
             .focused($isFocused)
             .defaultFocus($isFocused, true)
             .onKeyPress(keys: [.leftArrow, .upArrow, .rightArrow, .downArrow], action: navigate)
-            // Not on key repeat: once the selected emoji is gone, a held key would remove photo after photo.
-            .onKeyPress(keys: [Self.backspace, .delete, .deleteForward], phases: .down, action: delete)
+            .onKeyPress(keys: [Self.backspace, .delete, .deleteForward], phases: [.down, .repeat], action: delete)
             .toolbar {
                 ToolbarItemGroup(placement: .primaryAction) {
                     Button("Add Emoji") { batch.addEmoji() }
@@ -101,6 +100,9 @@ struct ContentView: View {
 
     private func delete(_ press: KeyPress) -> KeyPress.Result {
         guard press.modifiers.isDisjoint(with: [.command, .option, .control, .shift]) else { return .ignored }
+        // A held key deletes once. Its repeats are taken, so that AppKit does not beep, but do nothing:
+        // once the selected emoji is gone they would remove photo after photo.
+        guard press.phase == .down else { return .handled }
         if batch.selectedEmojiID != nil {
             batch.deleteSelectedEmoji()
         } else if let current = batch.currentPhotoID {
